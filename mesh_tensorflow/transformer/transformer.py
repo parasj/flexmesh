@@ -144,7 +144,8 @@ class Context(object):
                read_priority=None,
                inputs=None,
                encoder_inputs=None,
-               num_microbatches=1):
+               num_microbatches=1,
+               skip_blocks=0):
     """Create a context.
 
     Args:
@@ -201,6 +202,8 @@ class Context(object):
         decoder.
       num_microbatches: integer - greater than one if the step has been
         serialized into multiple microbatches to save memory.
+      skip_blocks: integer - if zero, skip no blocks. if positive, skip the first n blocks,
+        if negative skip the last n blocks.
     """
     self.model = model
     self.mesh = mesh
@@ -234,6 +237,7 @@ class Context(object):
     self.inputs = inputs
     self.encoder_inputs = encoder_inputs
     self.num_microbatches = num_microbatches
+    self.skip_blocks = skip_blocks
 
   @property
   def train(self):
@@ -409,7 +413,13 @@ class LayerStack(TransformerLayer):
     """Call the layer stack."""
     x = self._call_sublayers(self._sublayers_initial, x, context)
     context.layer_outputs.append(x)
-    for lnum, layer in enumerate(self._layers):
+    if context.skip_blocks == 0:
+      selected_layers = self._layers
+    elif context.skip_blocks >= 0:
+      selected_layers = self._layers[context.skip_blocks:]
+    elif context.skip_blocks <= 0:
+      selected_layers = self._layers[:context.skip_blocks]
+    for lnum, layer in enumerate(selected_layers):
       with tf.variable_scope(layer.name or ""):
         if self._recompute_grads:
           def fn(x, l=layer, c=context):
@@ -1389,6 +1399,169 @@ class Unitransformer(object):
 
 
 @gin.configurable
+class DynamicUnitransformer(Unitransformer):
+  def __init__(self,
+               layer_stack,
+               d_model=1024,
+               input_vocab_size=gin.REQUIRED,
+               output_vocab_size=gin.REQUIRED,
+               autoregressive=gin.REQUIRED,
+               max_length=gin.REQUIRED,
+               shared_embedding_and_softmax_weights=False,
+               label_smoothing=0.0,
+               z_loss=1e-4,
+               name="transformer",
+               layout=None,
+               mesh_shape=None,
+               vocab_divisor=128,
+               ensemble=None,
+               loss_fn=None,
+               positional_embedding=True,
+               sinusoid_positional_embedding=False,
+               input_full_attention=False,
+               loss_on_targets_only=False,
+               loss_denominator=None,
+               token_dropout_rate=0.0):
+    super().__init__(
+      layer_stack,
+      d_model=d_model,
+      input_vocab_size=input_vocab_size,
+      output_vocab_size=output_vocab_size,
+      autoregressive=autoregressive,
+      max_length=max_length,
+      shared_embedding_and_softmax_weights=shared_embedding_and_softmax_weights,
+      label_smoothing=label_smoothing,
+      z_loss=z_loss,
+      name=name,
+      layout=layout,
+      mesh_shape=mesh_shape,
+      vocab_divisor=vocab_divisor,
+      ensemble=ensemble,
+      loss_fn=loss_fn,
+      positional_embedding=positional_embedding,
+      sinusoid_positional_embedding=sinusoid_positional_embedding,
+      input_full_attention=input_full_attention,
+      loss_on_targets_only=loss_on_targets_only,
+      loss_denominator=loss_denominator,
+      token_dropout_rate=token_dropout_rate
+    )
+
+  def call_simple(self,
+                  inputs,
+                  targets,
+                  compute_loss,
+                  mode=tf.estimator.ModeKeys.TRAIN,
+                  variable_dtype=mtf.VariableDType(tf.float32),
+                  sequence_id=None,
+                  subsequence_id=None,
+                  position=None,
+                  encoder_output=None,
+                  encoder_sequence_id=None,
+                  encoder_inputs=None,
+                  shared_params=None,
+                  layer_outputs=None,
+                  encoder_layer_outputs=None,
+                  num_microbatches=1,
+                  skip_blocks=0):
+    """Compute logits based on inputs (all positions in parallel).
+
+    This is called during training and evaluation.
+
+    Args:
+      inputs: an int32 Tensor with shape [<batch_dims>, length_dim] For training
+        autoregressive models this should be equal to
+        autoregressive_inputs(targets, sequence_id).
+      targets: an optional int32 Tensor with shape [<batch_dims>, length_dim]
+      compute_loss: a boolean
+      mode: a tf.estimator.ModeKeys
+      variable_dtype: a mtf.VariableDType
+      sequence_id: an optional Tensor
+      subsequence_id: an optional Tensor
+      position: an optional Tensor
+      encoder_output: an optional Tensor
+      encoder_sequence_id: an optional Tensor
+      encoder_inputs: an optional Tensor
+      shared_params: an optional dictionary
+      layer_outputs: an optional list to append Tensor layer activations to
+      encoder_layer_outputs: optional - readonly list of tensor activations when
+        decoding, one per each input layer + the embedding layer
+      num_microbatches: integer - greater than one if the step has been
+        serialized into multiple microbatches to save memory.
+      skip_blocks: integer - if 0, skip no blocks. if positive, skip the first n layers.
+        if negative, skip the last n layers.
+
+    Returns:
+      logits: a Tensor with shape [<batch_dims>, output_vocab_dim]
+      loss: an optional Scalar (if compute_loss=True)
+    """
+    batch_dims = inputs.shape.dims[:-1]
+    length_dim = inputs.shape.dims[-1]
+    length_range = mtf.range(inputs.mesh, length_dim, dtype=tf.int32)
+    if not self.positional_embedding:
+      # To make relative attention faster, we drop the information about the
+      #   position in the subsequence.  The relative attention code then
+      #   assumes that the positions are given by index in the tensor,
+      #   which still leads to the correct computation of relative position.
+      position = None
+    if position is None:
+      position_is_default = True
+      position = length_range
+    else:
+      position_is_default = False
+    if self.input_full_attention:
+      # The inputs part of each sequence can fully attend within itself.
+      full_attention_region = delimited_lm_inputs_mask(targets)
+      # We can include one additional position to the right - the position
+      #   where the final EOS of the inputs is read and the first target token
+      #   is predicted.
+      full_attention_region = mtf.logical_or(
+          full_attention_region,
+          mtf.shift(full_attention_region, offset=1, dim=length_dim, wrap=False)
+      )
+      # We set read_priority and write_priority to 0 in the full-attention
+      #   region and equal to the position elsewhere.
+      read_priority = write_priority = length_range * mtf.cast(
+          mtf.logical_not(full_attention_region), tf.int32)
+    elif self.autoregressive:
+      # Vanilla autoregressive model - each position can see previous positions.
+      read_priority = write_priority = length_range
+    else:
+      read_priority = write_priority = None
+    context = Context(
+        model=self,
+        mesh=inputs.mesh,
+        batch_dims=batch_dims,
+        length_dim=length_dim,
+        variable_dtype=variable_dtype,
+        mode=mode,
+        losses=[] if compute_loss else None,
+        sequence_id=sequence_id,
+        subsequence_id=subsequence_id,
+        position=position,
+        position_is_default=position_is_default,
+        encoder_output=encoder_output,
+        encoder_sequence_id=encoder_sequence_id,
+        shared_params=shared_params,
+        layer_outputs=layer_outputs,
+        encoder_layer_outputs=encoder_layer_outputs,
+        write_priority=write_priority,
+        read_priority=read_priority,
+        inputs=inputs,
+        encoder_inputs=encoder_inputs,
+        num_microbatches=num_microbatches,
+        skip_blocks=skip_blocks)
+    with tf.variable_scope(self.name):
+      logits = self._call_internal(context, inputs, targets)
+    if compute_loss:
+      loss = mtf.add_n(context.losses)
+    else:
+      loss = None
+    return logits, loss
+
+
+
+
+@gin.configurable
 def shift_targets(targets, bos_id=0, eos_id=1):
   """Transforms decoder labels to decoder inputs.
 
@@ -1698,6 +1871,126 @@ class Bitransformer(object):
 
 
 @gin.configurable
+class FlexBitransformer(Bitransformer):
+  def __init__(self, encoder, decoder, shared_embedding=True, num_hierarchies=1):
+    super().__init__(encoder, decoder, shared_embedding)
+    self.num_hierarchies = num_hierarchies
+  
+  def call_simple(self,
+                  inputs,
+                  targets,
+                  compute_loss,
+                  mode=tf.estimator.ModeKeys.TRAIN,
+                  variable_dtype=mtf.VariableDType(tf.float32),
+                  encoder_sequence_id=None,
+                  decoder_sequence_id=None,
+                  decoder_subsequence_id=None,
+                  encoder_position=None,
+                  decoder_position=None,
+                  num_microbatches=1):
+    """Compute logits based on inputs (all positions in parallel).
+
+    This is called during training and evaluation.
+
+    Args:
+      inputs: an int32 Tensor with shape [<batch_dims>, length_dim]
+      targets: an optional int32 Tensor with shape [<batch_dims>, length_dim]
+      compute_loss: a boolean
+      mode: a tf.estimator.ModeKeys
+      variable_dtype: a mtf.VariableDType
+      encoder_sequence_id: an optional Tensor
+      decoder_sequence_id: an optional Tensor
+      decoder_subsequence_id: an optional Tensor
+      encoder_position: an optional Tensor
+      decoder_position: an optional Tensor
+      num_microbatches: integer - greater than one if the step has been
+        serialized into multiple microbatches to save memory.
+
+    Returns:
+      logits: a Tensor with shape [<batch_dims>, output_vocab_dim]
+      loss: an optional Scalar (if compute_loss=True)
+    """
+    if mode is not tf.estimator.ModeKeys.TRAIN:
+      return super().call_simple(inputs, targets, compute_loss, mode=mode, variable_dtype=variable_dtype,
+        encoder_sequence_id=encoder_sequence_id, decoder_sequence_id=decoder_sequence_id,
+        decoder_subsequence_id=decoder_subsequence_id, encoder_position=encoder_position,
+        decoder_position=decoder_position, num_microbatches=num_microbatches)
+    else:
+      # encoder_sequene_id and decoder_sequence_id are used to delineate packed
+      # examples but are also necessary to indicate padding where sequence_id==0.
+      # If they are absent, then we assume that padding is indicated by zeros in
+      # the inputs/targets, and we make up sequence_id tensors to indicate this.
+      if encoder_sequence_id is None:
+        encoder_sequence_id = mtf.minimum(inputs, 1)
+      if decoder_sequence_id is None:
+        decoder_sequence_id = mtf.minimum(targets, 1)
+      shared_params = self._shared_params(inputs.mesh, variable_dtype)
+
+      inputs_chunked = mtf.split(inputs, 0, self.num_hierarchies)
+      if targets is not None:
+        targets_chunked = mtf.split(targets, 0, self.num_hierarchies)
+      if encoder_sequence_id is not None:
+        encoder_sequence_id_chunked = mtf.split(encoder_sequence_id, 0, self.num_hierarchies)
+      if decoder_sequence_id is not None:
+        decoder_sequence_id_chunked = mtf.split(decoder_sequence_id, 0, self.num_hierarchies)
+      if decoder_subsequence_id is not None:
+        decoder_subsequence_id_chunked = mtf.split(decoder_subsequence_id, 0, self.num_hierarchies)
+      if encoder_position is not None:
+        encoder_position_chunked = mtf.split(encoder_position, 0, self.num_hierarchies)
+      if decoder_position is not None:
+        decoder_position_chunked = mtf.split(decoder_position, 0, self.num_hierarchies)
+      
+      losses = []
+      for hierarchy_idx in range(self.num_hierarchies):
+        inputs_chunk = inputs_chunked[hierarchy_idx] if inputs else None
+        targets_chunk = targets_chunked[hierarchy_idx] if targets else None
+        encoder_sequence_id_chunk = encoder_sequence_id_chunked[hierarchy_idx] if encoder_sequence_id else None
+        decoder_sequence_id_chunk = decoder_sequence_id_chunked[hierarchy_idx] if decoder_sequence_id else None
+        decoder_subsequence_id_chunk = decoder_subsequence_id_chunked[hierarchy_idx] if decoder_subsequence_id else None
+        encoder_position_chunk = encoder_position_chunked[hierarchy_idx] if encoder_position else None
+        decoder_position_chunk = decoder_position_chunked[hierarchy_idx] if decoder_position else None
+
+        encoder_layer_outputs = []
+        encoder_output, encoder_loss = self.encoder.call_simple(
+            inputs_chunk,
+            None,
+            compute_loss,
+            mode=mode,
+            variable_dtype=variable_dtype,
+            sequence_id=encoder_sequence_id_chunk,
+            position=encoder_position_chunk,
+            shared_params=shared_params,
+            layer_outputs=encoder_layer_outputs,
+            num_microbatches=num_microbatches,
+            skip_blocks=-hierarchy_idx)
+        encoder_output = mtf.layers.rename_length_to_memory_length(encoder_output)
+        if encoder_sequence_id_chunk is not None:
+          encoder_sequence_id_chunk = mtf.layers.rename_length_to_memory_length(
+              encoder_sequence_id_chunk)
+
+        logits, loss = self.decoder.call_simple(
+            autoregressive_inputs(targets_chunk, sequence_id=decoder_sequence_id_chunk),
+            targets_chunk,
+            compute_loss,
+            mode=mode,
+            variable_dtype=variable_dtype,
+            sequence_id=decoder_sequence_id_chunk,
+            subsequence_id=decoder_subsequence_id_chunk,
+            encoder_output=encoder_output,
+            encoder_sequence_id=encoder_sequence_id_chunk,
+            encoder_inputs=mtf.layers.rename_length_to_memory_length(inputs_chunk),
+            position=decoder_position_chunk,
+            shared_params=shared_params,
+            encoder_layer_outputs=encoder_layer_outputs,
+            num_microbatches=num_microbatches,
+            skip_blocks=hierarchy_idx)
+        if loss is not None and encoder_loss is not None:
+          loss += encoder_loss
+        losses.append(loss)
+      return logits, losses
+
+
+@gin.configurable
 class StudentTeacher(object):
   """A teacher and a student to be taught via distillation."""
 
@@ -1995,6 +2288,63 @@ def make_bitransformer(
         mesh_shape=mesh_shape)
   with gin.config_scope("decoder"):
     decoder = Unitransformer(
+        layer_stack=make_layer_stack(),
+        input_vocab_size=output_vocab_size,
+        output_vocab_size=output_vocab_size,
+        autoregressive=True,
+        name=decoder_name,
+        layout=layout,
+        mesh_shape=mesh_shape)
+  return bitransformer_cls(encoder, decoder)
+
+
+@gin.configurable
+def make_flex_bitransformer(
+    input_vocab_size=gin.REQUIRED,
+    output_vocab_size=gin.REQUIRED,
+    layout=None,
+    mesh_shape=None,
+    encoder_name="encoder",
+    decoder_name="decoder",
+    bitransformer_cls=FlexBitransformer):
+  """Gin-configurable bitransformer constructor.
+
+  In your config file you need to set the encoder and decoder layers like this:
+  encoder/make_layer_stack.layers = [
+    @transformer_layers.SelfAttention,
+    @transformer_layers.DenseReluDense,
+  ]
+  decoder/make_layer_stack.layers = [
+    @transformer_layers.SelfAttention,
+    @transformer_layers.EncDecAttention,
+    @transformer_layers.DenseReluDense,
+  ]
+
+  Args:
+    input_vocab_size: a integer
+    output_vocab_size: an integer
+    layout: optional - an input to mtf.convert_to_layout_rules
+      Some layers (e.g. MoE layers) cheat by looking at layout and mesh_shape
+    mesh_shape: optional - an input to mtf.convert_to_shape
+      Some layers (e.g. MoE layers) cheat by looking at layout and mesh_shape
+    encoder_name: optional - a string giving the Unitransformer encoder name.
+    decoder_name: optional - a string giving the Unitransformer decoder name.
+    bitransformer_cls: a class that implements the bitransformer with the
+      encoder and decoder both of which are Unitransformer instances.
+  Returns:
+    a bitransformer_cls instance
+  """
+  with gin.config_scope("encoder"):
+    encoder = DynamicUnitransformer(
+        layer_stack=make_layer_stack(),
+        input_vocab_size=input_vocab_size,
+        output_vocab_size=None,
+        autoregressive=False,
+        name=encoder_name,
+        layout=layout,
+        mesh_shape=mesh_shape)
+  with gin.config_scope("decoder"):
+    decoder = DynamicUnitransformer(
         layer_stack=make_layer_stack(),
         input_vocab_size=output_vocab_size,
         output_vocab_size=output_vocab_size,

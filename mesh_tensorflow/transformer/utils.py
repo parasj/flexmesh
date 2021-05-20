@@ -227,6 +227,12 @@ def build_model(model_type="bitransformer",
         output_vocab_size=output_vocab_size,
         mesh_shape=mesh_shape,
         layout=layout_rules)
+  elif model_type == "flex_bitransformer":
+    return transformer.make_flex_bitransformer(
+        input_vocab_size=input_vocab_size,
+        output_vocab_size=output_vocab_size,
+        mesh_shape=mesh_shape,
+        layout=layout_rules)
   elif model_type in ["lm", "delimited_lm", "aligned"]:
     return transformer.Unitransformer(
         autoregressive=model_type in ["lm", "delimited_lm"],
@@ -839,7 +845,7 @@ def tpu_estimator_model_fn(model_type,
         )
       elif isinstance(
           transformer_model,
-          transformer.Bitransformer) or model_type == "bi_student_teacher":
+          transformer.Bitransformer) or model_type == "bi_student_teacher" or model_type == "flex_bitransformer":
         position_kwargs = dict(
             encoder_sequence_id=mtf_features.get("inputs_segmentation", None),
             decoder_sequence_id=mtf_features.get("targets_segmentation",
@@ -866,19 +872,41 @@ def tpu_estimator_model_fn(model_type,
                                                     sequence_length,
                                                     mesh_shape,
                                                     layout_rules)
-      if num_microbatches > 1:
-        def serialized_fn(mtf_features):
-          return {"loss": logits_and_loss(mtf_features, num_microbatches)[1]}
-        var_grads, loss_dict = mtf.serialize_training_step(
-            mtf_features, serialized_fn, batch_dim, num_microbatches)
-        loss = loss_dict["loss"]
-      else:
-        loss = logits_and_loss(mtf_features)[1]
-        var_grads = mtf.gradients(
-            [loss], [v.outputs[0] for v in graph.trainable_variables])
+      if model_type != 'flex_bitransformer':
+        if num_microbatches > 1:
+          def serialized_fn(mtf_features):
+            return {"loss": logits_and_loss(mtf_features, num_microbatches)[1]}
+          var_grads, loss_dict = mtf.serialize_training_step(
+              mtf_features, serialized_fn, batch_dim, num_microbatches)
+          loss = loss_dict["loss"]
+        else:
+          loss = logits_and_loss(mtf_features)[1]
+          var_grads = mtf.gradients(
+              [loss], [v.outputs[0] for v in graph.trainable_variables])
 
-      if tpu_summaries:
-        mtf.scalar_summary("loss", loss)
+        if tpu_summaries:
+          mtf.scalar_summary("loss", loss)
+      else:        
+        if num_microbatches > 1:
+          def serialized_fn(mtf_features):
+            losses = logits_and_loss(mtf_features, num_microbatches)[1]
+            loss = mtf.reduce_sum(losses)
+            return {"loss": loss, "losses": losses}
+          var_grads, loss_dict = mtf.serialize_training_step(
+              mtf_features, serialized_fn, batch_dim, num_microbatches)
+          loss = loss_dict["loss"]
+          losses = loss_dict["losses"]
+        else:
+          losses = logits_and_loss(mtf_features)[1]
+          loss = mtf.reduce_sum(losses)
+          var_grads = mtf.gradients(
+              [loss], [v.outputs[0] for v in graph.trainable_variables])
+
+        if tpu_summaries:
+          mtf.scalar_summary("loss", loss)  # compound loss
+          for idx, loss_val in enumerate(losses):
+            mtf.scalar_summary(f"loss_{idx}", loss_val)
+
 
       if callable(learning_rate_schedule):
         # the following happens on CPU since TPU can't handle summaries.
