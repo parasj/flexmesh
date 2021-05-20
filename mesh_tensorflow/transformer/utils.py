@@ -903,9 +903,10 @@ def tpu_estimator_model_fn(model_type,
               [loss], [v.outputs[0] for v in graph.trainable_variables])
 
         if tpu_summaries:
-          mtf.scalar_summary("loss", loss)  # compound loss
+          mtf.scalar_summary("loss_summed", loss)  # compound loss
           for idx, loss_val in enumerate(losses):
             mtf.scalar_summary(f"loss_{idx}", loss_val)
+          mtf.scalar_summary(f"loss", losses[0])
 
 
       if callable(learning_rate_schedule):
